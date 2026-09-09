@@ -1,8 +1,3 @@
--- ============================================================
---  NEVERLOSE ESP MODULE (loads separately via loadstring/HttpGet)
---  Host this file on GitHub and set ESP_SERVER_URL in the main
---  script to its raw URL.
--- ============================================================
 return function(env)
     local Settings = env.Settings
     local createDrawing = env.createDrawing
