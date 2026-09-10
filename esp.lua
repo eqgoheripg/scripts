@@ -9,12 +9,15 @@ return function(env)
     local getCharacterHead = env.getCharacterHead
     local getCharacterRoot = env.getCharacterRoot
     local isIgnoredSCP = env.isIgnoredSCP
+    local isTeammate = env.isTeammate
+    local getCachedPlayers = env.getCachedPlayers
 
     local Players = game:GetService("Players")
     local Workspace = game:GetService("Workspace")
     local RunService = game:GetService("RunService")
     local UserInputService = game:GetService("UserInputService")
     local LocalPlayer = Players.LocalPlayer
+    local Camera = Workspace.CurrentCamera
 
     local EspGui = Instance.new("ScreenGui")
     EspGui.Name = "Neverlose_ESP_Gui"
@@ -193,13 +196,399 @@ local function scanAllSCPs()
     end
 end
 
+local NUM_RIPPLE_SEGMENTS = 20
+local MAX_RIPPLES = 32
+local SoundRipplePool = {}
+local ActiveSoundRipples = {}
+local PlayerSoundTrackers = {}
+
+local SIN_COS_TABLE = {}
+for i = 1, NUM_RIPPLE_SEGMENTS do
+    local angle = (i - 1) * (2 * math.pi / NUM_RIPPLE_SEGMENTS)
+    SIN_COS_TABLE[i] = { Cos = math.cos(angle), Sin = math.sin(angle) }
+end
+
+local function createRippleObject()
+    local lines = {}
+    for i = 1, NUM_RIPPLE_SEGMENTS do
+        lines[i] = createDrawing("Line", {
+            Thickness = Settings.SoundESP_RingThickness or 1.0,
+            Color = Settings.SoundESP_Color,
+            Transparency = 1,
+            Visible = false,
+            ZIndex = 2
+        })
+    end
+    local text = createDrawing("Text", {
+        Size = 11,
+        Center = true,
+        Outline = true,
+        OutlineColor = Color3.new(0, 0, 0),
+        Color = Color3.fromRGB(255, 255, 255),
+        Visible = false,
+        ZIndex = 3
+    })
+    return {
+        Lines = lines,
+        Text = text,
+        Active = false,
+        StartTime = 0,
+        Duration = 1.0,
+        MaxRadius = 3.0,
+        Center = Vector3.new(0, 0, 0),
+        Color = Color3.fromRGB(75, 125, 254),
+        Label = "STEP"
+    }
+end
+
+for i = 1, MAX_RIPPLES do
+    table.insert(SoundRipplePool, createRippleObject())
+end
+
+local function getGroundPosition(char, hrp)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    local ignoreList = { char, Camera }
+    if LocalPlayer.Character then table.insert(ignoreList, LocalPlayer.Character) end
+    rayParams.FilterDescendantsInstances = ignoreList
+    rayParams.IgnoreWater = true
+
+    local hit = Workspace:Raycast(hrp.Position, Vector3.new(0, -10, 0), rayParams)
+    if hit and hit.Position then
+        return hit.Position + Vector3.new(0, 0.08, 0)
+    end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hipHeight = (hum and hum.HipHeight > 0) and hum.HipHeight or 2.0
+    return hrp.Position - Vector3.new(0, hipHeight + 0.8, 0)
+end
+
+local function spawnSoundRipple(position, soundType, player, customDuration, customRadius)
+    if not Settings.SoundESP_Enabled then return end
+    Camera = Workspace.CurrentCamera
+    if not Camera then return end
+
+    local dist = (Camera.CFrame.Position - position).Magnitude
+    if dist > Settings.SoundESP_MaxDistance then return end
+
+    if player and player:IsA("Player") then
+        if Settings.SoundESP_TeamCheck and isTeammate(player) then
+            return
+        end
+    end
+
+    local color = Settings.SoundESP_Color
+    if player and Settings.SoundESP_UseTeamColors then
+        color = getPlayerColor(player)
+    end
+
+    local duration = math.max(0.3, customDuration or Settings.SoundESP_Duration)
+    local maxRadius = customRadius or Settings.SoundESP_MaxRadius
+    local now = tick()
+
+    local ripple = nil
+    for _, r in ipairs(SoundRipplePool) do
+        if not r.Active then
+            ripple = r
+            break
+        end
+    end
+
+    if not ripple then
+        local worstScore = -1
+        local worstIdx = 1
+        for idx, r in ipairs(ActiveSoundRipples) do
+            local rDist = (Camera.CFrame.Position - r.Center).Magnitude
+            local elapsed = now - r.StartTime
+            local score = (rDist / 100) + (elapsed / r.Duration) * 4
+            if score > worstScore then
+                worstScore = score
+                worstIdx = idx
+            end
+        end
+        ripple = table.remove(ActiveSoundRipples, worstIdx)
+    end
+
+    if ripple then
+        ripple.Active = true
+        ripple.StartTime = now
+        ripple.Duration = duration
+        ripple.MaxRadius = maxRadius
+        ripple.Center = position
+        ripple.Color = color
+        ripple.Label = soundType or "STEP"
+        table.insert(ActiveSoundRipples, ripple)
+    end
+end
+
+local function updateSoundRipples()
+    if #ActiveSoundRipples == 0 then return end
+    Camera = Workspace.CurrentCamera
+    if not Camera then return end
+
+    local now = tick()
+    local i = 1
+    while i <= #ActiveSoundRipples do
+        local ripple = ActiveSoundRipples[i]
+        local elapsed = now - ripple.StartTime
+        local progress = elapsed / ripple.Duration
+
+        if progress >= 1 or not Settings.SoundESP_Enabled then
+            ripple.Active = false
+            for _, line in ipairs(ripple.Lines) do
+                line.Visible = false
+            end
+            if ripple.Text then
+                ripple.Text.Visible = false
+            end
+            table.remove(ActiveSoundRipples, i)
+        else
+            local inv = 1 - progress
+            local easeProgress = 1 - (inv * inv * inv)
+            local currentRadius = math.max(0.2, ripple.MaxRadius * easeProgress)
+            local currentAlpha = math.clamp(inv * inv * 1.15, 0, 1)
+            local center = ripple.Center
+            local distToCam = (Camera.CFrame.Position - center).Magnitude
+
+            if distToCam <= Settings.SoundESP_MaxDistance then
+                local centerScreen, centerOnScreen = Camera:WorldToViewportPoint(center)
+                if centerScreen.Z > 0.1 then
+                    local points2D = {}
+                    local anyValid = false
+
+                    for seg = 1, NUM_RIPPLE_SEGMENTS do
+                        local sc = SIN_COS_TABLE[seg]
+                        local worldPoint = center + Vector3.new(sc.Cos * currentRadius, 0, sc.Sin * currentRadius)
+                        local screenPos, onScreen = Camera:WorldToViewportPoint(worldPoint)
+                        points2D[seg] = { Pos = screenPos, OnScreen = onScreen, Z = screenPos.Z }
+                        if screenPos.Z > 0.1 and onScreen then
+                            anyValid = true
+                        end
+                    end
+
+                    if anyValid then
+                        for seg = 1, NUM_RIPPLE_SEGMENTS do
+                            local p1 = points2D[seg]
+                            local nextSeg = (seg % NUM_RIPPLE_SEGMENTS) + 1
+                            local p2 = points2D[nextSeg]
+                            local line = ripple.Lines[seg]
+
+                            if p1.Z > 0.1 and p2.Z > 0.1 and (p1.OnScreen or p2.OnScreen) then
+                                line.From = Vector2.new(p1.Pos.X, p1.Pos.Y)
+                                line.To = Vector2.new(p2.Pos.X, p2.Pos.Y)
+                                line.Color = ripple.Color
+                                line.Transparency = currentAlpha
+                                line.Thickness = Settings.SoundESP_RingThickness or 1.0
+                                line.Visible = true
+                            else
+                                line.Visible = false
+                            end
+                        end
+
+                        if Settings.SoundESP_ShowText and ripple.Text then
+                            local textWorldPos = center + Vector3.new(0, 0.25 + (progress * 0.35), 0)
+                            local textScreenPos, textOnScreen = Camera:WorldToViewportPoint(textWorldPos)
+
+                            if textOnScreen and textScreenPos.Z > 0.1 then
+                                local soundIcon = (ripple.Label == "JUMP" and "▲ JUMP") or (ripple.Label == "LAND" and "▼ LAND") or "●"
+                                ripple.Text.Text = soundIcon .. " " .. math.floor(distToCam * 0.28) .. "m"
+                                ripple.Text.Position = Vector2.new(textScreenPos.X, textScreenPos.Y)
+                                ripple.Text.Color = ripple.Color
+                                ripple.Text.Transparency = currentAlpha
+                                ripple.Text.Visible = true
+                            else
+                                ripple.Text.Visible = false
+                            end
+                        elseif ripple.Text then
+                            ripple.Text.Visible = false
+                        end
+                    else
+                        for _, line in ipairs(ripple.Lines) do
+                            line.Visible = false
+                        end
+                        if ripple.Text then ripple.Text.Visible = false end
+                    end
+                else
+                    for _, line in ipairs(ripple.Lines) do
+                        line.Visible = false
+                    end
+                    if ripple.Text then ripple.Text.Visible = false end
+                end
+            else
+                for _, line in ipairs(ripple.Lines) do
+                    line.Visible = false
+                end
+                if ripple.Text then ripple.Text.Visible = false end
+            end
+
+            i = i + 1
+        end
+    end
+end
+
+local function getOrCreatePlayerTracker(player, initialPos)
+    local tracker = PlayerSoundTrackers[player]
+    if not tracker then
+        tracker = {
+            Connections = {},
+            LastPos = initialPos,
+            LastStepTime = tick(),
+            LastJumpTime = 0,
+            LastLandTime = 0,
+            WasInAir = false
+        }
+        PlayerSoundTrackers[player] = tracker
+    else
+        tracker.Connections = tracker.Connections or {}
+        tracker.LastStepTime = tracker.LastStepTime or tick()
+        tracker.LastJumpTime = tracker.LastJumpTime or 0
+        tracker.LastLandTime = tracker.LastLandTime or 0
+        if tracker.WasInAir == nil then tracker.WasInAir = false end
+        if initialPos and not tracker.LastPos then tracker.LastPos = initialPos end
+    end
+    return tracker
+end
+
+local function trackPlayerCharacter(player, char)
+    if player == LocalPlayer or not char then return end
+
+    local tracker = getOrCreatePlayerTracker(player)
+
+    for _, conn in ipairs(tracker.Connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    tracker.Connections = {}
+
+    local hum = char:WaitForChild("Humanoid", 3)
+    local hrp = char:WaitForChild("HumanoidRootPart", 3)
+    if not hum or not hrp then return end
+
+    tracker.LastPos = hrp.Position
+    tracker.LastStepTime = tick()
+    tracker.LastJumpTime = 0
+    tracker.LastLandTime = 0
+    tracker.WasInAir = false
+
+    local stateConn = hum.StateChanged:Connect(function(oldState, newState)
+        if not Settings.SoundESP_Enabled or not Settings.SoundESP_ShowJumps then return end
+        if Settings.SoundESP_TeamCheck and isTeammate(player) then return end
+
+        local now = tick()
+        if hrp and hrp.Parent then
+            if newState == Enum.HumanoidStateType.Jumping and (now - tracker.LastJumpTime >= 0.55) then
+                tracker.LastJumpTime = now
+                local ground = getGroundPosition(char, hrp)
+                spawnSoundRipple(ground, "JUMP", player, Settings.SoundESP_Duration * 1.25, Settings.SoundESP_MaxRadius * 1.35)
+            elseif newState == Enum.HumanoidStateType.Landed and oldState == Enum.HumanoidStateType.Freefall and (now - tracker.LastLandTime >= 0.45) then
+                if Settings.SoundESP_ShowLandings then
+                    tracker.LastLandTime = now
+                    tracker.WasInAir = false
+                    local ground = getGroundPosition(char, hrp)
+                    spawnSoundRipple(ground, "LAND", player, Settings.SoundESP_Duration * 1.1, Settings.SoundESP_MaxRadius * 1.2)
+                end
+            end
+        end
+    end)
+    table.insert(tracker.Connections, stateConn)
+end
+
+local function setupPlayerSoundESP(player)
+    if player == LocalPlayer then return end
+    local tracker = getOrCreatePlayerTracker(player)
+    if player.Character then
+        trackPlayerCharacter(player, player.Character)
+    end
+    local charAddedConn = player.CharacterAdded:Connect(function(newChar)
+        task.wait(0.2)
+        trackPlayerCharacter(player, newChar)
+    end)
+    table.insert(tracker.Connections, charAddedConn)
+end
+
+for _, p in ipairs(getCachedPlayers()) do
+    if p ~= LocalPlayer then
+        setupPlayerSoundESP(p)
+    end
+end
+
+local SoundPlayerAddedConn = Players.PlayerAdded:Connect(setupPlayerSoundESP)
+local SoundPlayerRemovingConn = Players.PlayerRemoving:Connect(function(player)
+    if PlayerSoundTrackers[player] then
+        for _, conn in ipairs(PlayerSoundTrackers[player].Connections) do
+            pcall(function() conn:Disconnect() end)
+        end
+        PlayerSoundTrackers[player] = nil
+    end
+end)
+
+task.spawn(function()
+    while task.wait(0.12) do
+        Camera = Workspace.CurrentCamera
+        if Settings.SoundESP_Enabled and Camera then
+            local now = tick()
+            for _, player in ipairs(getCachedPlayers()) do
+                if player ~= LocalPlayer and player.Character then
+                    if not Settings.SoundESP_TeamCheck or not isTeammate(player) then
+                        local char = player.Character
+                        local hrp = char:FindFirstChild("HumanoidRootPart")
+                        local hum = char:FindFirstChildOfClass("Humanoid")
+
+                        if hum and hrp and hum.Health > 0 then
+                            local currentPos = hrp.Position
+                            local distToCam = (Camera.CFrame.Position - currentPos).Magnitude
+
+                            if distToCam <= Settings.SoundESP_MaxDistance then
+                                local tracker = getOrCreatePlayerTracker(player, currentPos)
+                                local vel = hrp.AssemblyLinearVelocity or hrp.Velocity
+                                local horizSpeed = (Vector3.new(vel.X, 0, vel.Z)).Magnitude
+                                local isMoving = (horizSpeed > 1.5)
+
+                                if not tracker.LastPos then tracker.LastPos = currentPos end
+                                local movedDist = (Vector3.new(currentPos.X, 0, currentPos.Z) - Vector3.new(tracker.LastPos.X, 0, tracker.LastPos.Z)).Magnitude
+                                local timeSinceLast = now - (tracker.LastStepTime or 0)
+
+                                if Settings.SoundESP_ShowSteps then
+                                    if (movedDist >= 2.5 or (isMoving and timeSinceLast >= 0.30)) and (timeSinceLast >= 0.25) then
+                                        tracker.LastStepTime = now
+                                        tracker.LastPos = currentPos
+                                        local ground = getGroundPosition(char, hrp)
+                                        spawnSoundRipple(ground, "STEP", player, Settings.SoundESP_Duration, Settings.SoundESP_MaxRadius)
+                                    elseif timeSinceLast > 1.0 then
+                                        tracker.LastPos = currentPos
+                                    end
+                                end
+
+                                local velY = vel.Y
+                                if velY > 8.5 and (now - (tracker.LastJumpTime or 0) >= 0.55) and Settings.SoundESP_ShowJumps then
+                                    tracker.LastJumpTime = now
+                                    tracker.WasInAir = true
+                                    local ground = getGroundPosition(char, hrp)
+                                    spawnSoundRipple(ground, "JUMP", player, Settings.SoundESP_Duration * 1.25, Settings.SoundESP_MaxRadius * 1.35)
+                                elseif velY < -6.0 then
+                                    tracker.WasInAir = true
+                                elseif tracker.WasInAir and math.abs(velY) < 3.0 and (now - (tracker.LastLandTime or 0) >= 0.45) and Settings.SoundESP_ShowLandings then
+                                    tracker.WasInAir = false
+                                    tracker.LastLandTime = now
+                                    local ground = getGroundPosition(char, hrp)
+                                    spawnSoundRipple(ground, "LAND", player, Settings.SoundESP_Duration * 1.1, Settings.SoundESP_MaxRadius * 1.2)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+
 
     task.spawn(scanAllSCPs)
 
     local lastPeriodicScpScan = 0
 
     local function renderESP()
-        local Camera = Workspace.CurrentCamera
+        Camera = Workspace.CurrentCamera
         if not Camera then return end
         local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
         local screenBottom = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
@@ -501,6 +890,7 @@ end
                 end
             end
         end
+        updateSoundRipples()
     end
 
     local function destroyESP()
@@ -510,6 +900,38 @@ end
         for model in pairs(SCPEntities) do
             removeSCPESP(model)
         end
+        if SoundPlayerAddedConn then pcall(function() SoundPlayerAddedConn:Disconnect() end) end
+        if SoundPlayerRemovingConn then pcall(function() SoundPlayerRemovingConn:Disconnect() end) end
+        for player, tracker in pairs(PlayerSoundTrackers) do
+            if tracker.Connections then
+                for _, conn in ipairs(tracker.Connections) do
+                    pcall(function() conn:Disconnect() end)
+                end
+            end
+        end
+        PlayerSoundTrackers = {}
+        for _, ripple in ipairs(SoundRipplePool) do
+            if ripple.Lines then
+                for _, line in ipairs(ripple.Lines) do
+                    pcall(function() line:Remove() end)
+                end
+            end
+            if ripple.Text then
+                pcall(function() ripple.Text:Remove() end)
+            end
+        end
+        SoundRipplePool = {}
+        for _, ripple in ipairs(ActiveSoundRipples) do
+            if ripple.Lines then
+                for _, line in ipairs(ripple.Lines) do
+                    pcall(function() line:Remove() end)
+                end
+            end
+            if ripple.Text then
+                pcall(function() ripple.Text:Remove() end)
+            end
+        end
+        ActiveSoundRipples = {}
         if EspGui then
             pcall(function() EspGui:Destroy() end)
         end
