@@ -937,11 +937,102 @@ end)
         end
     end
 
+    local acHooked = false
+    local function setupAntiCheat()
+        if acHooked then return end
+        if not Settings.ACBypass_Enabled then return end
+        acHooked = true
+        pcall(function()
+            local gmt = getrawmetatable(game)
+            setreadonly(gmt, false)
+            local oldIndex = gmt.__index
+            local oldNamecall = gmt.__namecall
+            local bannedClasses = {
+                BodyVelocity = true, BodyGyro = true, BodyThrust = true,
+                BodyAngularVelocity = true, BoxHandleAdornment = true,
+                PlayerHighlight = true, Highlight = true,
+            }
+            local bannedNames = {
+                ["based puller"] = true,
+                ["TP Click"] = true,
+            }
+            local bannedRemotes = {
+                LoadstringRemote = true,
+                ReportRemote = true,
+            }
+            local remoteBanCache = {}
+
+            gmt.__namecall = newcclosure(function(self, ...)
+                local method = getnamecallmethod()
+                if method == "FireServer" or method == "InvokeServer" then
+                    if not checkcaller() then
+                        local cached = remoteBanCache[self]
+                        if cached == nil then
+                            cached = bannedRemotes[oldIndex(self, "Name")] == true
+                            remoteBanCache[self] = cached
+                        end
+                        if cached then return end
+                    end
+                elseif method == "IsA" then
+                    local classArg = ...
+                    if bannedClasses[classArg] and not checkcaller() then
+                        if bannedClasses[oldIndex(self, "ClassName")] then return false end
+                    end
+                elseif method == "FindFirstChildWhichIsA" or method == "FindFirstChildOfClass" then
+                    local classArg = ...
+                    if bannedClasses[classArg] and not checkcaller() then return nil end
+                elseif method == "FindFirstChild" then
+                    local nameArg = ...
+                    if bannedNames[nameArg] and not checkcaller() then return nil end
+                elseif method == "GetChildren" then
+                    if not checkcaller() then
+                        local realResults = oldNamecall(self, ...)
+                        local n = #realResults
+                        if n > 0 and n <= 64 then
+                            local filtered, w = {}, 0
+                            for i = 1, n do
+                                local inst = realResults[i]
+                                if not bannedClasses[oldIndex(inst, "ClassName")] and not bannedNames[oldIndex(inst, "Name")] then
+                                    w = w + 1
+                                    filtered[w] = inst
+                                end
+                            end
+                            if w ~= n then return filtered end
+                        end
+                        return realResults
+                    end
+                end
+                return oldNamecall(self, ...)
+            end)
+
+            gmt.__index = newcclosure(function(self, key)
+                if key == "WalkSpeed" then
+                    if not checkcaller() and oldIndex(self, "ClassName") == "Humanoid" then return 16 end
+                elseif key == "JumpPower" then
+                    if not checkcaller() and oldIndex(self, "ClassName") == "Humanoid" then return 50 end
+                elseif key == "Size" then
+                    if not checkcaller() then
+                        local n = oldIndex(self, "Name")
+                        if n == "Head" or n == "HumanoidRootPart" then
+                            local cls = oldIndex(self, "ClassName")
+                            if cls == "Part" or cls == "MeshPart" then return Vector3.new(2, 1, 1) end
+                        end
+                    end
+                end
+                return oldIndex(self, key)
+            end)
+            setreadonly(gmt, true)
+        end)
+    end
+
+    task.spawn(setupAntiCheat)
+
     return {
         Render = renderESP,
         ScanAll = scanAllSCPs,
         RegisterSCPModel = registerSCPModel,
         RemoveSCPESP = removeSCPESP,
         Destroy = destroyESP,
+        SetupAntiCheat = setupAntiCheat,
     }
 end
